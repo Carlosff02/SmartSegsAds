@@ -46,7 +46,9 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, confusion_matrix
 )
-
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestClassifier
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -104,6 +106,52 @@ DISPOSITIVO_MAP = {1: "Móvil", 2: "Escritorio", 3: "Tablet"}
 EDAD_MAP        = {1: "18–24 años", 2: "25–34 años", 3: "35–44 años", 4: "45+ años"}
 
 COLUMNAS_REQUERIDAS = ALL_FEATURES + ["convirtio"]
+# ------------------------------------------------------------------------------
+#  Objetivo estratégico 3 — Predicción de churn de clientes (Random Forest)
+# ------------------------------------------------------------------------------
+CHURN_FEATURES = ["antiguedad_meses", "frecuencia_campanas", "satisfaccion", "inversion_mensual", "interaccion"]
+
+CHURN_LABELS = {
+    "antiguedad_meses":    "Antigüedad (meses)",
+    "frecuencia_campanas": "Frecuencia de campañas",
+    "satisfaccion":        "Satisfacción (1-10)",
+    "inversion_mensual":   "Inversión mensual (S/)",
+    "interaccion":         "Nivel de interacción (%)",
+}
+
+CHURN_DESCRIPTIONS = {
+    "antiguedad_meses":    "Meses que el cliente lleva con la agencia · cuantitativa discreta",
+    "frecuencia_campanas": "Campañas gestionadas en el último año · cuantitativa discreta",
+    "satisfaccion":        "Puntaje de satisfacción del cliente (1 a 10) · cuantitativa continua",
+    "inversion_mensual":   "Inversión publicitaria mensual del cliente, en soles · cuantitativa continua",
+    "interaccion":         "Nivel de interacción con reportes y reuniones (%) · cuantitativa continua",
+}
+
+COLUMNAS_REQUERIDAS_CHURN = CHURN_FEATURES + ["abandono"]
+# ------------------------------------------------------------------------------
+#  Objetivo estratégico 2 — Predicción de ROI de campañas (Regresión Lineal)
+# ------------------------------------------------------------------------------
+ROI_FEATURES = ["presupuesto", "impresiones", "clics", "ctr", "duracion_dias", "conversiones"]
+
+ROI_LABELS = {
+    "presupuesto":   "Presupuesto (S/)",
+    "impresiones":   "Impresiones",
+    "clics":         "Clics",
+    "ctr":           "CTR (%)",
+    "duracion_dias": "Duración (días)",
+    "conversiones":  "Conversiones",
+}
+
+ROI_DESCRIPTIONS = {
+    "presupuesto":   "Inversión asignada a la campaña, en soles · cuantitativa continua",
+    "impresiones":   "Número de veces que se mostró el anuncio · cuantitativa discreta",
+    "clics":         "Clics totales recibidos por la campaña · cuantitativa discreta",
+    "ctr":           "Click-Through Rate de la campaña (%) · cuantitativa continua",
+    "duracion_dias": "Días de duración de la campaña · cuantitativa discreta",
+    "conversiones":  "Conversiones (ventas o leads) atribuidas a la campaña · cuantitativa discreta",
+}
+
+COLUMNAS_REQUERIDAS_ROI = ROI_FEATURES + ["roi"]
 
 
 # ==============================================================================
@@ -302,7 +350,377 @@ class SmartSegModel:
         proba = self.clf.predict_proba(nuevo_scaled)[0]
         return int(pred), proba
 
+class ROIModel:
+    """
+    Objetivo estratégico 2: Optimizar la inversión publicitaria mediante la
+    predicción del ROI esperado de una campaña, usando Regresión Lineal
+    Múltiple sobre presupuesto, impresiones, clics, CTR, duración y conversiones.
+    """
 
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+
+        self.df_raw = None
+        self.scaler = None
+        self.reg    = None
+
+        self.features_used = list(ROI_FEATURES)
+        self.test_size      = 0.20
+
+        self.X_train = self.X_test = None
+        self.y_train = self.y_test = None
+        self.y_pred_train = self.y_pred_test = None
+
+        self.train_metrics = {}
+        self.test_metrics  = {}
+
+        self.coeficientes = None
+        self.intercepto    = 0.0
+        self.fuente         = "simulado"
+        self.n_raw           = 0
+
+    # ── A. Datos simulados ────────────────────────────────────────────────
+    def generar_dataset_simulado(self):
+        np.random.seed(self.seed)
+        n = 500
+        presupuesto   = np.round(np.random.uniform(500, 15000, n), 2)
+        duracion_dias = np.random.randint(3, 61, n)
+        ctr           = np.round(np.random.uniform(0.5, 8.0, n), 2)
+        impresiones   = np.round(presupuesto * np.random.uniform(30, 80, n)).astype(int)
+        clics         = np.round(impresiones * (ctr / 100.0)).astype(int)
+        tasa_conv     = np.random.uniform(0.02, 0.15, n)
+        conversiones  = np.maximum(1, np.round(clics * tasa_conv).astype(int))
+        ingreso_prom  = np.random.uniform(80, 250, n)
+        ingresos      = conversiones * ingreso_prom
+        roi = np.round(
+            ((ingresos - presupuesto) / presupuesto) * 100 + np.random.normal(0, 5, n), 2
+        )
+        self.df_raw = pd.DataFrame({
+            "presupuesto": presupuesto, "impresiones": impresiones, "clics": clics,
+            "ctr": ctr, "duracion_dias": duracion_dias, "conversiones": conversiones,
+            "roi": roi,
+        })
+        self.fuente = "simulado"
+        self.n_raw  = len(self.df_raw)
+        return self.df_raw
+
+    # ── B. Carga desde Excel ──────────────────────────────────────────────
+    def cargar_excel(self, ruta: str):
+        try:
+            df = pd.read_excel(ruta, engine="openpyxl")
+        except Exception as e:
+            return False, f"No se pudo abrir el archivo:\n{e}"
+
+        faltantes = [c for c in COLUMNAS_REQUERIDAS_ROI if c not in df.columns]
+        if faltantes:
+            return False, (
+                f"El archivo no tiene las columnas requeridas:\n"
+                f"{', '.join(faltantes)}\n\n"
+                f"Columnas esperadas:\n{', '.join(COLUMNAS_REQUERIDAS_ROI)}"
+            )
+
+        df = df[COLUMNAS_REQUERIDAS_ROI].copy()
+        for col in COLUMNAS_REQUERIDAS_ROI:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna()
+
+        if len(df) < 20:
+            return False, f"El archivo tiene solo {len(df)} filas. Se requieren al menos 20."
+
+        self.df_raw = df.reset_index(drop=True)
+        self.fuente = ruta
+        self.n_raw  = len(self.df_raw)
+        return True, f"Archivo cargado: {len(df)} registros."
+
+    # ── C. Entrenamiento ─────────────────────────────────────────────────
+    def entrenar(self, features=None, test_size: float = 0.20):
+        if not features:
+            features = list(ROI_FEATURES)
+        self.features_used = [f for f in ROI_FEATURES if f in features]
+        self.test_size = test_size
+
+        df = self.df_raw.dropna().copy()
+        X = df[self.features_used]
+        y = df["roi"]
+
+        self.scaler = MinMaxScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=test_size, random_state=self.seed
+        )
+        self.reg = LinearRegression()
+        self.reg.fit(X_train, y_train)
+
+        self.X_train, self.X_test = X_train, X_test
+        self.y_train, self.y_test = y_train, y_test
+
+        self.y_pred_train = self.reg.predict(X_train)
+        self.y_pred_test  = self.reg.predict(X_test)
+
+        self.train_metrics = self._calc_metrics(y_train, self.y_pred_train)
+        self.test_metrics  = self._calc_metrics(y_test, self.y_pred_test)
+
+        self.coeficientes = pd.Series(
+            self.reg.coef_, index=self.features_used
+        ).sort_values(key=abs, ascending=False)
+        self.intercepto = self.reg.intercept_
+        return self.test_metrics
+
+    @staticmethod
+    def _calc_metrics(y_true, y_pred):
+        return {
+            "r2":   r2_score(y_true, y_pred),
+            "mae":  mean_absolute_error(y_true, y_pred),
+            "rmse": mean_squared_error(y_true, y_pred) ** 0.5,
+            "n":    len(y_true),
+        }
+
+    # ── D. Predicción de campaña nueva ──────────────────────────────────
+    def predecir(self, presupuesto, impresiones, clics, ctr, duracion_dias, conversiones):
+        valores = {
+            "presupuesto": presupuesto, "impresiones": impresiones, "clics": clics,
+            "ctr": ctr, "duracion_dias": duracion_dias, "conversiones": conversiones,
+        }
+        nuevo = pd.DataFrame([valores])[self.features_used]
+        nuevo_scaled = self.scaler.transform(nuevo)
+        roi_estimado = self.reg.predict(nuevo_scaled)[0]
+        return float(roi_estimado)
+
+
+def generar_excel_ejemplo_roi(ruta: str):
+    
+    """Crea un Excel de muestra con el formato esperado para el módulo de ROI."""
+    np.random.seed(1)
+    n = 20
+    presupuesto = np.round(np.random.uniform(500, 15000, n), 2)
+    data = {
+        "presupuesto":   presupuesto,
+        "impresiones":   np.round(presupuesto * np.random.uniform(30, 80, n)).astype(int),
+        "clics":         np.random.randint(10, 800, n),
+        "ctr":           np.round(np.random.uniform(0.5, 8.0, n), 2),
+        "duracion_dias": np.random.randint(3, 61, n),
+        "conversiones":  np.random.randint(1, 60, n),
+        "roi":           np.round(np.random.uniform(-20, 120, n), 2),
+    }
+    df = pd.DataFrame(data)
+    with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Campañas")
+        ref = pd.DataFrame({
+            "Columna":     COLUMNAS_REQUERIDAS_ROI,
+            "Tipo":        ["Decimal", "Entero", "Entero", "Decimal", "Entero", "Entero", "Decimal"],
+            "Descripción": [
+                "Inversión de la campaña en soles",
+                "Impresiones totales del anuncio",
+                "Clics totales recibidos",
+                "Click-Through Rate en % (0.5–8.0)",
+                "Duración de la campaña en días (3–60)",
+                "Conversiones (ventas o leads) atribuidas",
+                "Variable objetivo: retorno de inversión en % (puede ser negativo)",
+            ],
+        })
+        ref.to_excel(writer, index=False, sheet_name="Referencia")
+
+class ChurnModel:
+    """
+    Objetivo estratégico 3: Mejorar la fidelización de clientes mediante la
+    predicción temprana de abandono (churn), usando un Random Forest
+    Classifier sobre variables de relación comercial con el cliente.
+    """
+
+    def __init__(self, seed: int = 42):
+        self.seed = seed
+
+        self.df_raw = None
+        self.df_bal = None
+        self.scaler = None
+        self.clf    = None
+
+        self.features_used = list(CHURN_FEATURES)
+        self.n_estimators   = 200
+        self.max_depth       = 6
+        self.test_size        = 0.20
+
+        self.X_train = self.X_test = None
+        self.y_train = self.y_test = None
+        self.y_pred_train = self.y_pred_test = None
+
+        self.train_metrics = {}
+        self.test_metrics  = {}
+
+        self.importances = None
+        self.n_outliers_removed = 0
+        self.fuente = "simulado"
+        self.n_raw  = 0
+
+    # ── A. Datos simulados ────────────────────────────────────────────────
+    def generar_dataset_simulado(self):
+        np.random.seed(self.seed)
+        n = 800
+        antiguedad_meses    = np.random.randint(1, 61, n)
+        frecuencia_campanas = np.random.randint(0, 21, n)
+        satisfaccion        = np.round(np.random.uniform(1, 10, n), 1)
+        inversion_mensual   = np.round(np.random.uniform(100, 5000, n), 2)
+        interaccion         = np.round(np.random.uniform(0, 100, n), 1)
+
+        prob_abandono = (
+            0.35 * (1 - satisfaccion / 10)
+            + 0.25 * (1 - interaccion / 100)
+            + 0.20 * (1 - frecuencia_campanas / 20)
+            + 0.10 * (1 - antiguedad_meses / 60)
+            + np.random.normal(0, 0.08, n)
+        )
+        abandono = (prob_abandono > 0.42).astype(int)
+
+        self.df_raw = pd.DataFrame({
+            "antiguedad_meses": antiguedad_meses, "frecuencia_campanas": frecuencia_campanas,
+            "satisfaccion": satisfaccion, "inversion_mensual": inversion_mensual,
+            "interaccion": interaccion, "abandono": abandono,
+        })
+        self.fuente = "simulado"
+        self.n_raw  = len(self.df_raw)
+        return self.df_raw
+
+    # ── B. Carga desde Excel ──────────────────────────────────────────────
+    def cargar_excel(self, ruta: str):
+        try:
+            df = pd.read_excel(ruta, engine="openpyxl")
+        except Exception as e:
+            return False, f"No se pudo abrir el archivo:\n{e}"
+
+        faltantes = [c for c in COLUMNAS_REQUERIDAS_CHURN if c not in df.columns]
+        if faltantes:
+            return False, (
+                f"El archivo no tiene las columnas requeridas:\n"
+                f"{', '.join(faltantes)}\n\n"
+                f"Columnas esperadas:\n{', '.join(COLUMNAS_REQUERIDAS_CHURN)}"
+            )
+
+        df = df[COLUMNAS_REQUERIDAS_CHURN].copy()
+        for col in COLUMNAS_REQUERIDAS_CHURN:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna()
+
+        abandono_vals = df["abandono"].unique()
+        invalid = [v for v in abandono_vals if v not in [0, 1]]
+        if invalid:
+            return False, (
+                f"Valores inválidos en 'abandono': {invalid}\n"
+                f"Permitidos: 0=No abandonó, 1=Abandonó"
+            )
+
+        if len(df) < 20:
+            return False, f"El archivo tiene solo {len(df)} filas. Se requieren al menos 20."
+
+        self.df_raw = df.reset_index(drop=True)
+        self.fuente = ruta
+        self.n_raw  = len(self.df_raw)
+        return True, f"Archivo cargado: {len(df)} registros."
+
+    # ── C. Limpieza y balanceo ────────────────────────────────────────────
+    def limpiar_y_balancear(self):
+        df = self.df_raw.dropna().copy()
+        antes = len(df)
+        self.n_outliers_removed = antes - len(df)
+
+        n_min = df["abandono"].value_counts().min()
+        df_0 = df[df["abandono"] == 0].sample(n=n_min, random_state=self.seed)
+        df_1 = df[df["abandono"] == 1].sample(n=n_min, random_state=self.seed)
+        self.df_bal = (
+            pd.concat([df_0, df_1])
+            .sample(frac=1, random_state=self.seed)
+            .reset_index(drop=True)
+        )
+
+        X = self.df_bal[self.features_used]
+        y = self.df_bal["abandono"]
+        self.scaler = MinMaxScaler()
+        X_scaled = self.scaler.fit_transform(X)
+        return X_scaled, y
+
+    # ── D. Entrenamiento ─────────────────────────────────────────────────
+    def entrenar(self, n_estimators: int = 200, max_depth: int = 6, features=None, test_size: float = 0.20):
+        if not features:
+            features = list(CHURN_FEATURES)
+        self.features_used = [f for f in CHURN_FEATURES if f in features]
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.test_size = test_size
+
+        X_scaled, y = self.limpiar_y_balancear()
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y, test_size=test_size, random_state=self.seed, stratify=y
+        )
+        self.clf = RandomForestClassifier(
+            n_estimators=n_estimators, max_depth=max_depth, random_state=self.seed
+        )
+        self.clf.fit(X_train, y_train)
+
+        self.X_train, self.X_test = X_train, X_test
+        self.y_train, self.y_test = y_train, y_test
+
+        self.y_pred_train = self.clf.predict(X_train)
+        self.y_pred_test  = self.clf.predict(X_test)
+
+        self.train_metrics = self._calc_metrics(y_train, self.y_pred_train)
+        self.test_metrics  = self._calc_metrics(y_test, self.y_pred_test)
+
+        self.importances = pd.Series(
+            self.clf.feature_importances_, index=self.features_used
+        ).sort_values(ascending=False)
+        return self.test_metrics
+
+    @staticmethod
+    def _calc_metrics(y_true, y_pred):
+        return {
+            "accuracy":  accuracy_score(y_true, y_pred),
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "recall":    recall_score(y_true, y_pred, zero_division=0),
+            "f1":        f1_score(y_true, y_pred, zero_division=0),
+            "confusion_matrix": confusion_matrix(y_true, y_pred),
+            "n": len(y_true),
+        }
+
+    # ── E. Predicción de cliente nuevo ──────────────────────────────────
+    def predecir(self, antiguedad_meses, frecuencia_campanas, satisfaccion, inversion_mensual, interaccion):
+        valores = {
+            "antiguedad_meses": antiguedad_meses, "frecuencia_campanas": frecuencia_campanas,
+            "satisfaccion": satisfaccion, "inversion_mensual": inversion_mensual,
+            "interaccion": interaccion,
+        }
+        nuevo = pd.DataFrame([valores])[self.features_used]
+        nuevo_scaled = self.scaler.transform(nuevo)
+        pred  = self.clf.predict(nuevo_scaled)[0]
+        proba = self.clf.predict_proba(nuevo_scaled)[0]
+        return int(pred), proba
+def generar_excel_ejemplo_churn(ruta: str):
+    """Crea un Excel de muestra con el formato esperado para el módulo de Churn."""
+    np.random.seed(2)
+    n = 20
+    data = {
+        "antiguedad_meses":    np.random.randint(1, 61, n),
+        "frecuencia_campanas": np.random.randint(0, 21, n),
+        "satisfaccion":        np.round(np.random.uniform(1, 10, n), 1),
+        "inversion_mensual":   np.round(np.random.uniform(100, 5000, n), 2),
+        "interaccion":         np.round(np.random.uniform(0, 100, n), 1),
+        "abandono":            np.random.choice([0, 1], n),
+    }
+    df = pd.DataFrame(data)
+    with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Clientes")
+        ref = pd.DataFrame({
+            "Columna":     COLUMNAS_REQUERIDAS_CHURN,
+            "Tipo":        ["Entero", "Entero", "Decimal", "Decimal", "Decimal", "Entero (0/1)"],
+            "Descripción": [
+                "Meses de relación comercial con el cliente (1–60)",
+                "Campañas gestionadas en el último año (0–20)",
+                "Satisfacción reportada por el cliente (1.0–10.0)",
+                "Inversión publicitaria mensual del cliente en soles",
+                "Nivel de interacción con reportes/reuniones en % (0–100)",
+                "Variable objetivo: 1=Abandonó · 0=No abandonó",
+            ],
+        })
+        ref.to_excel(writer, index=False, sheet_name="Referencia")
 # ==============================================================================
 #  GENERADOR DE EXCEL DE EJEMPLO
 # ==============================================================================
@@ -416,7 +834,7 @@ def paired_bar_row(parent, label, val_train, val_test, fmt="{:.1f}%"):
 # ==============================================================================
 class SmartSegApp(tk.Tk):
     TABS = ["Panel", "Configuración", "Segmentos", "Predicción",
-            "Entrenamiento vs Prueba", "Reglas del árbol"]
+        "Entrenamiento vs Prueba", "Reglas del árbol", "ROI Campañas", "Riesgo de Abandono"]
 
     def __init__(self):
         super().__init__()
@@ -434,7 +852,20 @@ class SmartSegApp(tk.Tk):
         self.var_max_depth = tk.IntVar(value=5)
         self.var_test_size = tk.DoubleVar(value=0.20)
         self.feature_count_label = None
-
+        self.roi_model = ROIModel()
+        self.roi_feature_vars = {f: tk.BooleanVar(value=True) for f in ROI_FEATURES}
+        self.roi_var_test_size = tk.DoubleVar(value=0.20)
+        self.roi_feature_count_label = None
+        self.roi_result_card  = None
+        self.roi_result_inner = None
+        self.churn_model = ChurnModel()
+        self.churn_feature_vars = {f: tk.BooleanVar(value=True) for f in CHURN_FEATURES}
+        self.churn_var_n_estimators = tk.IntVar(value=200)
+        self.churn_var_max_depth = tk.IntVar(value=6)
+        self.churn_var_test_size = tk.DoubleVar(value=0.20)
+        self.churn_feature_count_label = None
+        self.churn_result_card  = None
+        self.churn_result_inner = None
         self._build_topbar()
         self._build_nav()
 
@@ -446,7 +877,728 @@ class SmartSegApp(tk.Tk):
         self._entrenar_inicial_simulado()
         self._build_views()
         self._show_tab("Panel")
+    # ── ROI CAMPAÑAS ─────────────────────────────────────────────────────────
+    def _selected_roi_features(self):
+        sel = [f for f in ROI_FEATURES if self.roi_feature_vars[f].get()]
+        return sel if sel else list(ROI_FEATURES)
 
+    def _on_roi_feature_toggle(self):
+        n_sel = sum(1 for f in ROI_FEATURES if self.roi_feature_vars[f].get())
+        if self.roi_feature_count_label is not None:
+            self.roi_feature_count_label.configure(
+                text=f"{n_sel} de {len(ROI_FEATURES)} variables seleccionadas"
+            )
+    # ── RIESGO DE ABANDONO (CHURN) ──────────────────────────────────────────
+    def _selected_churn_features(self):
+        sel = [f for f in CHURN_FEATURES if self.churn_feature_vars[f].get()]
+        return sel if sel else list(CHURN_FEATURES)
+
+    def _on_churn_feature_toggle(self):
+        n_sel = sum(1 for f in CHURN_FEATURES if self.churn_feature_vars[f].get())
+        if self.churn_feature_count_label is not None:
+            self.churn_feature_count_label.configure(
+                text=f"{n_sel} de {len(CHURN_FEATURES)} variables seleccionadas"
+            )
+
+    def _cargar_excel_churn(self):
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar archivo Excel de clientes (Churn)",
+            filetypes=[("Archivos Excel", "*.xlsx *.xls"), ("Todos", "*.*")]
+        )
+        if not ruta:
+            return
+        ok, msg = self.churn_model.cargar_excel(ruta)
+        if not ok:
+            messagebox.showerror("Error al cargar Excel", msg)
+            return
+        try:
+            self.churn_model.entrenar(
+                n_estimators=self.churn_var_n_estimators.get(),
+                max_depth=self.churn_var_max_depth.get(),
+                features=self._selected_churn_features(),
+                test_size=self.churn_var_test_size.get(),
+            )
+        except Exception as e:
+            messagebox.showerror("Error al entrenar", str(e))
+            return
+        self.status_text.configure(
+            text=f"Excel Churn cargado: {msg} | accuracy test={self.churn_model.test_metrics['accuracy']*100:.1f}%"
+        )
+        self._refresh_churn_view()
+
+    def _descargar_plantilla_churn(self):
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar plantilla Excel Churn",
+            defaultextension=".xlsx",
+            initialfile="smartseg_churn_plantilla.xlsx",
+            filetypes=[("Archivo Excel", "*.xlsx")]
+        )
+        if not ruta:
+            return
+        try:
+            generar_excel_ejemplo_churn(ruta)
+            messagebox.showinfo(
+                "Plantilla guardada",
+                f"Plantilla guardada en:\n{ruta}\n\n"
+                "Contiene 20 filas de ejemplo y una hoja 'Referencia'.\n"
+                "Reemplaza los datos con tu cartera real de clientes y usa\n"
+                "'📂 Cargar Excel Churn' para entrenar el modelo."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar la plantilla:\n{e}")
+
+    def _reentrenar_churn(self):
+        if self.churn_model.fuente == "simulado":
+            self.churn_model.generar_dataset_simulado()
+        self.churn_model.entrenar(
+            n_estimators=self.churn_var_n_estimators.get(),
+            max_depth=self.churn_var_max_depth.get(),
+            features=self._selected_churn_features(),
+            test_size=self.churn_var_test_size.get(),
+        )
+        self.status_text.configure(
+            text=f"Modelo Churn reentrenado · accuracy test={self.churn_model.test_metrics['accuracy']*100:.1f}%"
+        )
+        self._refresh_churn_view()
+
+    def _aplicar_configuracion_churn(self):
+        seleccionadas = [f for f in CHURN_FEATURES if self.churn_feature_vars[f].get()]
+        if len(seleccionadas) == 0:
+            messagebox.showwarning(
+                "Selección inválida",
+                "Debes seleccionar al menos una variable (X) para entrenar el modelo de Churn."
+            )
+            return
+        self._reentrenar_churn()
+
+    def _refresh_churn_view(self):
+        if "Riesgo de Abandono" in self.views:
+            self.views["Riesgo de Abandono"].destroy()
+        self.views["Riesgo de Abandono"] = self._build_churn_view()
+        self._show_tab(self.active_tab.get())
+
+    def _ejecutar_prediccion_churn(self):
+        try:
+            antiguedad  = int(self.churn_var_antiguedad.get())
+            frecuencia  = int(self.churn_var_frecuencia.get())
+            satisfaccion = float(self.churn_var_satisfaccion.get())
+            inversion   = float(self.churn_var_inversion.get())
+            interaccion = float(self.churn_var_interaccion.get())
+        except Exception as ex:
+            messagebox.showerror("Error", f"Valor inválido en el formulario:\n{ex}")
+            return
+
+        pred, proba = self.churn_model.predecir(
+            antiguedad, frecuencia, satisfaccion, inversion, interaccion
+        )
+        prob_abandono = proba[1] * 100
+
+        if prob_abandono >= 60:
+            label, color, icon = "Alto riesgo de abandono", Theme.DANGER, "✗"
+            rec = "Contactar de inmediato al cliente y ofrecer un plan de retención personalizado."
+        elif prob_abandono >= 35:
+            label, color, icon = "Riesgo moderado", Theme.WARNING, "!"
+            rec = "Incluir en el plan de seguimiento preventivo y reforzar la comunicación de resultados."
+        else:
+            label, color, icon = "Cliente fidelizado", Theme.SUCCESS, "✓"
+            rec = "Mantener el nivel de servicio actual; bajo riesgo de abandono en el corto plazo."
+
+        if self.churn_result_inner:
+            self.churn_result_inner.destroy()
+        self.churn_result_card.pack(fill="x", padx=16, pady=(0, 16))
+        inner = tk.Frame(self.churn_result_card, bg=Theme.BG2)
+        inner.pack(fill="x", padx=14, pady=12)
+        self.churn_result_inner = inner
+
+        tk.Label(inner, text="Resultado de la clasificación", bg=Theme.BG2,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")
+                 ).pack(anchor="w", pady=(0, 10))
+        top = tk.Frame(inner, bg=Theme.BG2)
+        top.pack(fill="x")
+        tk.Label(top, text=icon, bg=Theme.BG2, fg=color,
+                 font=(Theme.FONT_FAMILY, 22, "bold")).pack(side="left", padx=(0, 12))
+        txt = tk.Frame(top, bg=Theme.BG2)
+        txt.pack(side="left", anchor="w")
+        tk.Label(txt, text=label, bg=Theme.BG2, fg=color,
+                 font=(Theme.FONT_FAMILY, 14, "bold")).pack(anchor="w")
+        tk.Label(txt, text=f"Probabilidad de abandono: {prob_abandono:.1f}%  ·  variables usadas: "
+                           f"{', '.join(CHURN_LABELS[f] for f in self.churn_model.features_used)}",
+                 bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                 font=(Theme.FONT_FAMILY, 9), wraplength=1000, justify="left").pack(anchor="w")
+        rec_box = tk.Frame(inner, bg=Theme.BG1)
+        rec_box.pack(fill="x", pady=(12, 0))
+        tk.Label(rec_box, text="💡  Recomendación de acción", bg=Theme.BG1,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")
+                 ).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(rec_box, text=rec, bg=Theme.BG1, fg=Theme.TEXT_PRIMARY,
+                 font=(Theme.FONT_FAMILY, 9), wraplength=1000, justify="left"
+                 ).pack(anchor="w", padx=10, pady=(0, 8))
+        self.status_text.configure(text=f"Predicción Churn: {label} ({prob_abandono:.1f}%)")
+
+    def _build_churn_view(self):
+        view   = tk.Frame(self.main_container, bg=Theme.BG0)
+        scroll = self._scrollable(view)
+        cm     = self.churn_model
+        tr, te = cm.train_metrics, cm.test_metrics
+
+        header = tk.Frame(scroll, bg=Theme.BG0)
+        header.pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(header, text="Riesgo de abandono de clientes (Random Forest)",
+                 bg=Theme.BG0, fg=Theme.TEXT_PRIMARY,
+                 font=(Theme.FONT_FAMILY, 12, "bold")).pack(side="left")
+        make_badge(header, f"  Accuracy test: {te.get('accuracy', 0)*100:.1f}%  ", "accent").pack(side="right")
+
+        tk.Label(scroll,
+                 text="Objetivo estratégico: mejorar la fidelización de clientes mediante la "
+                      "predicción temprana de abandono (churn) y la generación de estrategias "
+                      "preventivas de retención.",
+                 bg=Theme.BG0, fg=Theme.TEXT_MUTED, font=(Theme.FONT_FAMILY, 8),
+                 wraplength=1100, justify="left").pack(anchor="w", padx=16, pady=(0, 10))
+
+        fuente_txt = ("Dataset simulado de clientes — carga tu Excel real con '📂 Cargar Excel Churn'"
+                      if cm.fuente == "simulado"
+                      else f"Datos cargados desde: {os.path.basename(cm.fuente)} · {cm.n_raw} registros")
+        alert_kind = Theme.WARNING_BG if cm.fuente == "simulado" else Theme.ACCENT_BG
+        alert_fg   = Theme.WARNING    if cm.fuente == "simulado" else Theme.ACCENT
+        alert = tk.Frame(scroll, bg=alert_kind, highlightbackground=alert_fg, highlightthickness=1)
+        alert.pack(fill="x", padx=16, pady=(0, 10))
+        icon = "⚠" if cm.fuente == "simulado" else "✓"
+        tk.Label(alert, bg=alert_kind, fg=alert_fg, justify="left", anchor="w",
+                 font=(Theme.FONT_FAMILY, 9),
+                 text=f"{icon}  {fuente_txt}", wraplength=1120).pack(fill="x", padx=12, pady=10)
+
+        btn_row = tk.Frame(scroll, bg=Theme.BG0)
+        btn_row.pack(fill="x", padx=16, pady=(0, 10))
+        btn_load = tk.Label(btn_row, text="📂  Cargar Excel Churn", bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                             font=(Theme.FONT_FAMILY, 9, "bold"), padx=10, pady=5, cursor="hand2")
+        btn_load.pack(side="left", padx=(0, 6))
+        btn_load.bind("<Button-1>", lambda e: self._cargar_excel_churn())
+        btn_demo = tk.Label(btn_row, text="💾  Descargar plantilla Churn", bg=Theme.BG1, fg=Theme.TEXT_SECONDARY,
+                            font=(Theme.FONT_FAMILY, 9), padx=10, pady=5, cursor="hand2")
+        btn_demo.pack(side="left")
+        btn_demo.bind("<Button-1>", lambda e: self._descargar_plantilla_churn())
+
+        # ── Selección de variables (X) + parámetros ──
+        feat_card = make_card(scroll)
+        feat_card.pack(fill="x", padx=16, pady=(0, 12))
+        head = tk.Frame(feat_card, bg=Theme.BG2)
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(head, text="Variables predictoras (X) disponibles", bg=Theme.BG2,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")).pack(side="left")
+        n_sel = sum(1 for f in CHURN_FEATURES if self.churn_feature_vars[f].get())
+        self.churn_feature_count_label = tk.Label(
+            head, text=f"{n_sel} de {len(CHURN_FEATURES)} variables seleccionadas",
+            bg=Theme.BG2, fg=Theme.TEXT_MUTED, font=(Theme.FONT_FAMILY, 8)
+        )
+        self.churn_feature_count_label.pack(side="right")
+
+        feat_grid = tk.Frame(feat_card, bg=Theme.BG2)
+        feat_grid.pack(fill="x", padx=14, pady=(0, 6))
+        feat_grid.columnconfigure(0, weight=1)
+        feat_grid.columnconfigure(1, weight=1)
+        for i, feat in enumerate(CHURN_FEATURES):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(feat_grid, bg=Theme.BG1, highlightbackground=Theme.BORDER,
+                             highlightthickness=1)
+            cell.grid(row=r, column=c, sticky="ew", padx=6, pady=6)
+            feat_grid.rowconfigure(r, weight=1)
+            cb = tk.Checkbutton(
+                cell, text=CHURN_LABELS[feat], variable=self.churn_feature_vars[feat],
+                bg=Theme.BG1, fg=Theme.TEXT_PRIMARY, selectcolor=Theme.BG0,
+                activebackground=Theme.BG1, activeforeground=Theme.TEXT_PRIMARY,
+                font=(Theme.FONT_FAMILY, 10, "bold"), anchor="w",
+                command=self._on_churn_feature_toggle
+            )
+            cb.pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(cell, text=CHURN_DESCRIPTIONS[feat], bg=Theme.BG1, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8), wraplength=480, justify="left", anchor="w"
+                     ).pack(fill="x", padx=32, pady=(0, 8))
+
+        pgrid = tk.Frame(feat_card, bg=Theme.BG2)
+        pgrid.pack(fill="x", padx=14, pady=(0, 6))
+        pgrid.columnconfigure(0, weight=1)
+        pgrid.columnconfigure(1, weight=1)
+        self._form_slider(pgrid, 0, 0, "N.º de árboles (n_estimators)",
+                          self.churn_var_n_estimators, 50, 400, lambda v: f"{int(float(v))}")
+        self._form_slider(pgrid, 0, 1, "Profundidad máxima (max_depth)",
+                          self.churn_var_max_depth, 2, 12, lambda v: f"{int(float(v))}")
+        self._form_slider(pgrid, 1, 0, "% de datos para prueba (test_size)",
+                          self.churn_var_test_size, 0.10, 0.40, lambda v: f"{float(v)*100:.0f}%")
+
+        btn_apply = tk.Label(feat_card, text="⚙️  Aplicar y reentrenar modelo",
+                             bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                             font=(Theme.FONT_FAMILY, 10, "bold"), pady=9, cursor="hand2")
+        btn_apply.pack(fill="x", padx=14, pady=(8, 14))
+        btn_apply.bind("<Button-1>", lambda e: self._aplicar_configuracion_churn())
+
+        # ── KPIs train vs test ──
+        kpi_wrap = tk.Frame(scroll, bg=Theme.BG0)
+        kpi_wrap.pack(fill="x", padx=16, pady=(0, 10))
+        for i in range(4):
+            kpi_wrap.columnconfigure(i, weight=1)
+        metrics_labels = [("accuracy", "Accuracy"), ("precision", "Precision"),
+                          ("recall", "Recall"), ("f1", "F1 Score")]
+        for i, (key, lbl) in enumerate(metrics_labels):
+            card = make_card(kpi_wrap)
+            card.grid(row=0, column=i, sticky="nsew", padx=5)
+            tk.Label(card, text=lbl, bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8)).pack(anchor="w", padx=12, pady=(10, 4))
+            v_tr, v_te = tr.get(key, 0)*100, te.get(key, 0)*100
+            row = tk.Frame(card, bg=Theme.BG2)
+            row.pack(anchor="w", padx=12, pady=(0, 10))
+            tk.Label(row, text=f"{v_tr:.1f}%", bg=Theme.BG2, fg=Theme.BLUE,
+                     font=(Theme.FONT_FAMILY, 15, "bold")).pack(side="left")
+            tk.Label(row, text=" train  ", bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8)).pack(side="left")
+            tk.Label(row, text=f"{v_te:.1f}%", bg=Theme.BG2, fg=Theme.ACCENT,
+                     font=(Theme.FONT_FAMILY, 15, "bold")).pack(side="left")
+            tk.Label(row, text=" test", bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8)).pack(side="left")
+
+        # ── Matrices de confusión (reutiliza _confusion_matrix_widget) ──
+        cm_card = make_card(scroll)
+        cm_card.pack(fill="x", padx=16, pady=(0, 10))
+        tk.Label(cm_card, text="🔢  Matrices de confusión", bg=Theme.BG2,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")
+                 ).pack(anchor="w", padx=12, pady=(10, 8))
+        cm_row = tk.Frame(cm_card, bg=Theme.BG2)
+        cm_row.pack(fill="x", padx=12, pady=(0, 12))
+        cm_row.columnconfigure(0, weight=1)
+        cm_row.columnconfigure(1, weight=1)
+        self._confusion_matrix_widget(cm_row, tr["confusion_matrix"], "Entrenamiento", Theme.BLUE, 0)
+        self._confusion_matrix_widget(cm_row, te["confusion_matrix"], "Prueba", Theme.ACCENT, 1)
+
+        # ── Importancia de variables ──
+        imp_card = make_card(scroll)
+        imp_card.pack(fill="x", padx=16, pady=(0, 12))
+        tk.Label(imp_card, text="🌳  Importancia de variables (Random Forest)",
+                 bg=Theme.BG2, fg=Theme.TEXT_SECONDARY,
+                 font=(Theme.FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=12, pady=(10, 8))
+        imp_inner = tk.Frame(imp_card, bg=Theme.BG2)
+        imp_inner.pack(fill="x", padx=12, pady=(0, 6))
+        cols_cycle = [Theme.BLUE, Theme.GREEN, Theme.PURPLE, Theme.ORANGE, Theme.GOLD]
+        max_imp = cm.importances.max() if cm.importances is not None and len(cm.importances) else 0
+        if cm.importances is not None:
+            for i, (feat, imp) in enumerate(cm.importances.items()):
+                pct = (imp / max_imp) * 100 if max_imp > 0 else 0
+                row = tk.Frame(imp_inner, bg=Theme.BG2)
+                row.pack(fill="x", pady=3)
+                tk.Label(row, text=CHURN_LABELS.get(feat, feat), bg=Theme.BG2,
+                         fg=Theme.TEXT_PRIMARY, font=(Theme.FONT_FAMILY, 9),
+                         width=18, anchor="w").pack(side="left")
+                bar = tk.Canvas(row, height=8, bg=Theme.BG1, highlightthickness=0)
+                bar.pack(side="left", padx=8, fill="x", expand=True)
+
+                def make_drawer(canvas_ref, p, col):
+                    def draw(event=None):
+                        canvas_ref.delete("all")
+                        w  = canvas_ref.winfo_width() or 300
+                        fw = max(2, int(w * min(max(p, 0), 100) / 100))
+                        canvas_ref.create_rectangle(0, 0, w, 8, fill=Theme.BG1, outline="")
+                        canvas_ref.create_rectangle(0, 0, fw, 8, fill=col, outline="")
+                    return draw
+
+                bar.bind("<Configure>", make_drawer(bar, pct, cols_cycle[i % len(cols_cycle)]))
+                tk.Label(row, text=f"{imp:.3f}", bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                         font=(Theme.FONT_FAMILY, 9), width=6, anchor="e").pack(side="left")
+
+        # ── Predicción de cliente nuevo ──
+        form_card = make_card(scroll)
+        form_card.pack(fill="x", padx=16, pady=(0, 12))
+        tk.Label(form_card, text="Predecir riesgo de abandono de un cliente",
+                 bg=Theme.BG2, fg=Theme.TEXT_SECONDARY,
+                 font=(Theme.FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=14, pady=(12, 10))
+
+        fgrid = tk.Frame(form_card, bg=Theme.BG2)
+        fgrid.pack(fill="x", padx=14, pady=(0, 6))
+        fgrid.columnconfigure(0, weight=1)
+        fgrid.columnconfigure(1, weight=1)
+
+        self.churn_var_antiguedad   = tk.IntVar(value=18)
+        self.churn_var_frecuencia   = tk.IntVar(value=6)
+        self.churn_var_satisfaccion = tk.DoubleVar(value=7.0)
+        self.churn_var_inversion    = tk.DoubleVar(value=1500.0)
+        self.churn_var_interaccion  = tk.DoubleVar(value=55.0)
+
+        self._form_spinbox(fgrid, 0, 0, "Antigüedad (meses)",     self.churn_var_antiguedad,   1,   60, 1)
+        self._form_spinbox(fgrid, 0, 1, "Frecuencia de campañas", self.churn_var_frecuencia,   0,   20, 1)
+        self._form_slider(fgrid, 1, 0, "Satisfacción (1-10)",     self.churn_var_satisfaccion, 1.0, 10.0, lambda v: f"{float(v):.1f}")
+        self._form_spinbox(fgrid, 1, 1, "Inversión mensual (S/)", self.churn_var_inversion,    100, 5000, 50)
+        self._form_slider(fgrid, 2, 0, "Nivel de interacción (%)", self.churn_var_interaccion, 0.0, 100.0, lambda v: f"{float(v):.0f}%")
+
+        btn_pred = tk.Label(form_card, text="🌳  Predecir riesgo con Random Forest",
+                            bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                            font=(Theme.FONT_FAMILY, 10, "bold"), pady=9, cursor="hand2")
+        btn_pred.pack(fill="x", padx=14, pady=(10, 14))
+        btn_pred.bind("<Button-1>", lambda e: self._ejecutar_prediccion_churn())
+
+        self.churn_result_card  = make_card(scroll)
+        self.churn_result_inner = None
+
+        note = tk.Frame(scroll, bg=Theme.GOLD_BG, highlightbackground=Theme.GOLD, highlightthickness=1)
+        note.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Label(note, bg=Theme.GOLD_BG, fg=Theme.GOLD, justify="left", anchor="w",
+                 font=(Theme.FONT_FAMILY, 8),
+                 text="🎓  KPI del objetivo: Churn Rate (%). Detectar a tiempo a los clientes en "
+                      "riesgo permite a la agencia activar planes de retención antes de que "
+                      "decidan cancelar el servicio.",
+                 wraplength=1100).pack(fill="x", padx=12, pady=10)
+        return view
+    def _cargar_excel_roi(self):
+        ruta = filedialog.askopenfilename(
+            title="Seleccionar archivo Excel de campañas (ROI)",
+            filetypes=[("Archivos Excel", "*.xlsx *.xls"), ("Todos", "*.*")]
+        )
+        if not ruta:
+            return
+        ok, msg = self.roi_model.cargar_excel(ruta)
+        if not ok:
+            messagebox.showerror("Error al cargar Excel", msg)
+            return
+        try:
+            self.roi_model.entrenar(
+                features=self._selected_roi_features(),
+                test_size=self.roi_var_test_size.get(),
+            )
+        except Exception as e:
+            messagebox.showerror("Error al entrenar", str(e))
+            return
+        self.status_text.configure(
+            text=f"Excel ROI cargado: {msg} | R² test={self.roi_model.test_metrics['r2']:.3f}"
+        )
+        self._refresh_roi_view()
+
+    def _descargar_plantilla_roi(self):
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar plantilla Excel ROI",
+            defaultextension=".xlsx",
+            initialfile="smartseg_roi_plantilla.xlsx",
+            filetypes=[("Archivo Excel", "*.xlsx")]
+        )
+        if not ruta:
+            return
+        try:
+            generar_excel_ejemplo_roi(ruta)
+            messagebox.showinfo(
+                "Plantilla guardada",
+                f"Plantilla guardada en:\n{ruta}\n\n"
+                "Contiene 20 filas de ejemplo y una hoja 'Referencia'.\n"
+                "Reemplaza los datos con el historial real de campañas y usa\n"
+                "'📂 Cargar Excel ROI' para entrenar el modelo."
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo guardar la plantilla:\n{e}")
+
+    def _reentrenar_roi(self):
+        if self.roi_model.fuente == "simulado":
+            self.roi_model.generar_dataset_simulado()
+        self.roi_model.entrenar(
+            features=self._selected_roi_features(),
+            test_size=self.roi_var_test_size.get(),
+        )
+        self.status_text.configure(
+            text=f"Modelo ROI reentrenado · R² test={self.roi_model.test_metrics['r2']:.3f}"
+        )
+        self._refresh_roi_view()
+
+    def _aplicar_configuracion_roi(self):
+        seleccionadas = [f for f in ROI_FEATURES if self.roi_feature_vars[f].get()]
+        if len(seleccionadas) == 0:
+            messagebox.showwarning(
+                "Selección inválida",
+                "Debes seleccionar al menos una variable (X) para entrenar el modelo de ROI."
+            )
+            return
+        self._reentrenar_roi()
+
+    def _refresh_roi_view(self):
+        if "ROI Campañas" in self.views:
+            self.views["ROI Campañas"].destroy()
+        self.views["ROI Campañas"] = self._build_roi_view()
+        self._show_tab(self.active_tab.get())
+
+    def _embed_roi_scatter_chart(self, parent):
+        rm  = self.roi_model
+        fig = Figure(figsize=(4.6, 2.8), dpi=100)
+        fig.patch.set_facecolor(Theme.BG2)
+        ax  = fig.add_subplot(111)
+        ax.set_facecolor(Theme.BG2)
+        y_real = rm.y_test.values if hasattr(rm.y_test, "values") else rm.y_test
+        y_pred = rm.y_pred_test
+        ax.scatter(y_real, y_pred, s=18, color=Theme.ACCENT, alpha=0.75, edgecolors="none")
+        if len(y_real) > 0:
+            lo, hi = min(min(y_real), min(y_pred)), max(max(y_real), max(y_pred))
+            ax.plot([lo, hi], [lo, hi], color=Theme.TEXT_MUTED, linestyle="--", linewidth=1)
+        ax.set_xlabel("ROI real (%)", fontsize=8, color=Theme.TEXT_MUTED)
+        ax.set_ylabel("ROI predicho (%)", fontsize=8, color=Theme.TEXT_MUTED)
+        ax.tick_params(colors=Theme.TEXT_MUTED, labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color(Theme.BORDER)
+        fig.tight_layout()
+        FigureCanvasTkAgg(fig, master=parent).get_tk_widget().pack(
+            fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _ejecutar_prediccion_roi(self):
+        try:
+            presupuesto  = float(self.roi_var_presupuesto.get())
+            impresiones  = int(self.roi_var_impresiones.get())
+            clics        = int(self.roi_var_clics.get())
+            ctr          = float(self.roi_var_ctr.get())
+            duracion     = int(self.roi_var_duracion.get())
+            conversiones = int(self.roi_var_conversiones.get())
+        except Exception as ex:
+            messagebox.showerror("Error", f"Valor inválido en el formulario:\n{ex}")
+            return
+
+        roi_estimado = self.roi_model.predecir(
+            presupuesto, impresiones, clics, ctr, duracion, conversiones
+        )
+
+        if roi_estimado >= 30:
+            label, color, icon = "Alto retorno esperado", Theme.SUCCESS, "✓"
+            rec = "Priorizar esta configuración de campaña dentro del presupuesto disponible."
+        elif roi_estimado >= 0:
+            label, color, icon = "Retorno positivo moderado", Theme.WARNING, "!"
+            rec = "Viable, pero conviene ajustar segmentación o creatividades antes de escalar la inversión."
+        else:
+            label, color, icon = "Retorno negativo esperado", Theme.DANGER, "✗"
+            rec = "No se recomienda invertir con esta configuración; revisar presupuesto, alcance o segmentación."
+
+        if self.roi_result_inner:
+            self.roi_result_inner.destroy()
+        self.roi_result_card.pack(fill="x", padx=16, pady=(0, 16))
+        inner = tk.Frame(self.roi_result_card, bg=Theme.BG2)
+        inner.pack(fill="x", padx=14, pady=12)
+        self.roi_result_inner = inner
+
+        tk.Label(inner, text="Resultado de la predicción", bg=Theme.BG2,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")
+                 ).pack(anchor="w", pady=(0, 10))
+        top = tk.Frame(inner, bg=Theme.BG2)
+        top.pack(fill="x")
+        tk.Label(top, text=icon, bg=Theme.BG2, fg=color,
+                 font=(Theme.FONT_FAMILY, 22, "bold")).pack(side="left", padx=(0, 12))
+        txt = tk.Frame(top, bg=Theme.BG2)
+        txt.pack(side="left", anchor="w")
+        tk.Label(txt, text=label, bg=Theme.BG2, fg=color,
+                 font=(Theme.FONT_FAMILY, 14, "bold")).pack(anchor="w")
+        tk.Label(txt, text=f"ROI estimado: {roi_estimado:+.1f}%  ·  variables usadas: "
+                           f"{', '.join(ROI_LABELS[f] for f in self.roi_model.features_used)}",
+                 bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                 font=(Theme.FONT_FAMILY, 9), wraplength=1000, justify="left").pack(anchor="w")
+        rec_box = tk.Frame(inner, bg=Theme.BG1)
+        rec_box.pack(fill="x", pady=(12, 0))
+        tk.Label(rec_box, text="💡  Recomendación de acción", bg=Theme.BG1,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")
+                 ).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(rec_box, text=rec, bg=Theme.BG1, fg=Theme.TEXT_PRIMARY,
+                 font=(Theme.FONT_FAMILY, 9), wraplength=1000, justify="left"
+                 ).pack(anchor="w", padx=10, pady=(0, 8))
+        self.status_text.configure(text=f"Predicción ROI: {label} ({roi_estimado:+.1f}%)")
+
+    def _build_roi_view(self):
+        view   = tk.Frame(self.main_container, bg=Theme.BG0)
+        scroll = self._scrollable(view)
+        rm     = self.roi_model
+
+        header = tk.Frame(scroll, bg=Theme.BG0)
+        header.pack(fill="x", padx=16, pady=(14, 4))
+        tk.Label(header, text="Predicción de ROI de campañas (Regresión Lineal Múltiple)",
+                 bg=Theme.BG0, fg=Theme.TEXT_PRIMARY,
+                 font=(Theme.FONT_FAMILY, 12, "bold")).pack(side="left")
+        make_badge(header, f"  R² test: {rm.test_metrics.get('r2', 0):.2f}  ", "gold").pack(side="right")
+
+        tk.Label(scroll,
+                 text="Objetivo estratégico: optimizar la inversión publicitaria prediciendo el "
+                      "ROI esperado de una campaña antes de invertir, a partir de su presupuesto, "
+                      "alcance y desempeño histórico.",
+                 bg=Theme.BG0, fg=Theme.TEXT_MUTED, font=(Theme.FONT_FAMILY, 8),
+                 wraplength=1100, justify="left").pack(anchor="w", padx=16, pady=(0, 10))
+
+        fuente_txt = ("Dataset simulado de campañas — carga tu Excel real con '📂 Cargar Excel ROI'"
+                      if rm.fuente == "simulado"
+                      else f"Datos cargados desde: {os.path.basename(rm.fuente)} · {rm.n_raw} registros")
+        alert_kind = Theme.WARNING_BG if rm.fuente == "simulado" else Theme.ACCENT_BG
+        alert_fg   = Theme.WARNING    if rm.fuente == "simulado" else Theme.ACCENT
+        alert = tk.Frame(scroll, bg=alert_kind, highlightbackground=alert_fg, highlightthickness=1)
+        alert.pack(fill="x", padx=16, pady=(0, 10))
+        icon = "⚠" if rm.fuente == "simulado" else "✓"
+        tk.Label(alert, bg=alert_kind, fg=alert_fg, justify="left", anchor="w",
+                 font=(Theme.FONT_FAMILY, 9),
+                 text=f"{icon}  {fuente_txt}", wraplength=1120).pack(fill="x", padx=12, pady=10)
+
+        btn_row = tk.Frame(scroll, bg=Theme.BG0)
+        btn_row.pack(fill="x", padx=16, pady=(0, 10))
+        btn_load = tk.Label(btn_row, text="📂  Cargar Excel ROI", bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                             font=(Theme.FONT_FAMILY, 9, "bold"), padx=10, pady=5, cursor="hand2")
+        btn_load.pack(side="left", padx=(0, 6))
+        btn_load.bind("<Button-1>", lambda e: self._cargar_excel_roi())
+        btn_demo = tk.Label(btn_row, text="💾  Descargar plantilla ROI", bg=Theme.BG1, fg=Theme.TEXT_SECONDARY,
+                            font=(Theme.FONT_FAMILY, 9), padx=10, pady=5, cursor="hand2")
+        btn_demo.pack(side="left")
+        btn_demo.bind("<Button-1>", lambda e: self._descargar_plantilla_roi())
+
+        # ── Selección de variables (X) ──
+        feat_card = make_card(scroll)
+        feat_card.pack(fill="x", padx=16, pady=(0, 12))
+        head = tk.Frame(feat_card, bg=Theme.BG2)
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(head, text="Variables predictoras (X) disponibles", bg=Theme.BG2,
+                 fg=Theme.TEXT_SECONDARY, font=(Theme.FONT_FAMILY, 9, "bold")).pack(side="left")
+        n_sel = sum(1 for f in ROI_FEATURES if self.roi_feature_vars[f].get())
+        self.roi_feature_count_label = tk.Label(
+            head, text=f"{n_sel} de {len(ROI_FEATURES)} variables seleccionadas",
+            bg=Theme.BG2, fg=Theme.TEXT_MUTED, font=(Theme.FONT_FAMILY, 8)
+        )
+        self.roi_feature_count_label.pack(side="right")
+
+        feat_grid = tk.Frame(feat_card, bg=Theme.BG2)
+        feat_grid.pack(fill="x", padx=14, pady=(0, 6))
+        feat_grid.columnconfigure(0, weight=1)
+        feat_grid.columnconfigure(1, weight=1)
+        for i, feat in enumerate(ROI_FEATURES):
+            r, c = divmod(i, 2)
+            cell = tk.Frame(feat_grid, bg=Theme.BG1, highlightbackground=Theme.BORDER,
+                             highlightthickness=1)
+            cell.grid(row=r, column=c, sticky="ew", padx=6, pady=6)
+            feat_grid.rowconfigure(r, weight=1)
+            cb = tk.Checkbutton(
+                cell, text=ROI_LABELS[feat], variable=self.roi_feature_vars[feat],
+                bg=Theme.BG1, fg=Theme.TEXT_PRIMARY, selectcolor=Theme.BG0,
+                activebackground=Theme.BG1, activeforeground=Theme.TEXT_PRIMARY,
+                font=(Theme.FONT_FAMILY, 10, "bold"), anchor="w",
+                command=self._on_roi_feature_toggle
+            )
+            cb.pack(fill="x", padx=8, pady=(6, 0))
+            tk.Label(cell, text=ROI_DESCRIPTIONS[feat], bg=Theme.BG1, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8), wraplength=480, justify="left", anchor="w"
+                     ).pack(fill="x", padx=32, pady=(0, 8))
+
+        pgrid = tk.Frame(feat_card, bg=Theme.BG2)
+        pgrid.pack(fill="x", padx=14, pady=(0, 6))
+        self._form_slider(pgrid, 0, 0, "% de datos para prueba (test_size)",
+                          self.roi_var_test_size, 0.10, 0.40, lambda v: f"{float(v)*100:.0f}%")
+
+        btn_apply = tk.Label(feat_card, text="⚙️  Aplicar y reentrenar modelo",
+                             bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                             font=(Theme.FONT_FAMILY, 10, "bold"), pady=9, cursor="hand2")
+        btn_apply.pack(fill="x", padx=14, pady=(8, 14))
+        btn_apply.bind("<Button-1>", lambda e: self._aplicar_configuracion_roi())
+
+        # ── KPIs ──
+        kpi_wrap = tk.Frame(scroll, bg=Theme.BG0)
+        kpi_wrap.pack(fill="x", padx=16, pady=(0, 10))
+        for i in range(4):
+            kpi_wrap.columnconfigure(i, weight=1)
+        tr, te = rm.train_metrics, rm.test_metrics
+        kpis = [
+            ("R² (train)",  f"{tr.get('r2', 0):.3f}",      Theme.BLUE,         "Ajuste en entrenamiento"),
+            ("R² (test)",   f"{te.get('r2', 0):.3f}",       Theme.ACCENT,       "Ajuste en datos no vistos"),
+            ("MAE (test)",  f"{te.get('mae', 0):.1f} pts",  Theme.TEXT_PRIMARY, "Error absoluto promedio de ROI"),
+            ("RMSE (test)", f"{te.get('rmse', 0):.1f} pts", Theme.TEXT_PRIMARY, "Error cuadrático medio"),
+        ]
+        for i, (lbl, val, col, sub) in enumerate(kpis):
+            card = make_card(kpi_wrap)
+            card.grid(row=0, column=i, sticky="nsew", padx=5)
+            tk.Label(card, text=lbl, bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8)).pack(anchor="w", padx=12, pady=(10, 2))
+            tk.Label(card, text=val, bg=Theme.BG2, fg=col,
+                     font=(Theme.FONT_FAMILY, 19, "bold")).pack(anchor="w", padx=12)
+            tk.Label(card, text=sub, bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                     font=(Theme.FONT_FAMILY, 8)).pack(anchor="w", padx=12, pady=(2, 10))
+
+        # ── Gráfico dispersión + coeficientes ──
+        grid2 = tk.Frame(scroll, bg=Theme.BG0)
+        grid2.pack(fill="x", padx=16, pady=(0, 10))
+        grid2.columnconfigure(0, weight=1)
+        grid2.columnconfigure(1, weight=1)
+
+        scatter_card = make_card(grid2)
+        scatter_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(scatter_card, text="📈  ROI real vs. ROI predicho (conjunto de prueba)",
+                 bg=Theme.BG2, fg=Theme.TEXT_SECONDARY,
+                 font=(Theme.FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        self._embed_roi_scatter_chart(scatter_card)
+
+        coef_card = make_card(grid2)
+        coef_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        tk.Label(coef_card, text="🧮  Coeficientes del modelo (impacto relativo)",
+                 bg=Theme.BG2, fg=Theme.TEXT_SECONDARY,
+                 font=(Theme.FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=12, pady=(10, 8))
+        coef_inner = tk.Frame(coef_card, bg=Theme.BG2)
+        coef_inner.pack(fill="x", padx=12, pady=(0, 8))
+        max_abs = rm.coeficientes.abs().max() if rm.coeficientes is not None and len(rm.coeficientes) else 0
+        if rm.coeficientes is not None:
+            for i, (feat, coef) in enumerate(rm.coeficientes.items()):
+                pct = (abs(coef) / max_abs) * 100 if max_abs > 0 else 0
+                color = Theme.SUCCESS if coef >= 0 else Theme.DANGER
+                row = tk.Frame(coef_inner, bg=Theme.BG2)
+                row.pack(fill="x", pady=3)
+                tk.Label(row, text=ROI_LABELS.get(feat, feat), bg=Theme.BG2, fg=Theme.TEXT_PRIMARY,
+                         font=(Theme.FONT_FAMILY, 9), width=16, anchor="w").pack(side="left")
+                bar = tk.Canvas(row, height=8, bg=Theme.BG1, highlightthickness=0)
+                bar.pack(side="left", padx=8, fill="x", expand=True)
+
+                def make_drawer(canvas_ref, p, col):
+                    def draw(event=None):
+                        canvas_ref.delete("all")
+                        w  = canvas_ref.winfo_width() or 300
+                        fw = max(2, int(w * min(max(p, 0), 100) / 100))
+                        canvas_ref.create_rectangle(0, 0, w, 8, fill=Theme.BG1, outline="")
+                        canvas_ref.create_rectangle(0, 0, fw, 8, fill=col, outline="")
+                    return draw
+
+                bar.bind("<Configure>", make_drawer(bar, pct, color))
+                tk.Label(row, text=f"{coef:+.2f}", bg=Theme.BG2, fg=Theme.TEXT_MUTED,
+                         font=(Theme.FONT_FAMILY, 9), width=7, anchor="e").pack(side="left")
+            tk.Label(coef_inner, text=f"Intercepto: {rm.intercepto:+.2f}", bg=Theme.BG2,
+                     fg=Theme.TEXT_MUTED, font=(Theme.FONT_FAMILY, 8, "italic")
+                     ).pack(anchor="w", pady=(6, 8))
+
+        # ── Predicción de campaña nueva ──
+        form_card = make_card(scroll)
+        form_card.pack(fill="x", padx=16, pady=(0, 12))
+        tk.Label(form_card, text="Predecir ROI de una campaña nueva",
+                 bg=Theme.BG2, fg=Theme.TEXT_SECONDARY,
+                 font=(Theme.FONT_FAMILY, 9, "bold")).pack(anchor="w", padx=14, pady=(12, 10))
+
+        fgrid = tk.Frame(form_card, bg=Theme.BG2)
+        fgrid.pack(fill="x", padx=14, pady=(0, 6))
+        fgrid.columnconfigure(0, weight=1)
+        fgrid.columnconfigure(1, weight=1)
+
+        self.roi_var_presupuesto  = tk.DoubleVar(value=3000.0)
+        self.roi_var_impresiones  = tk.IntVar(value=150000)
+        self.roi_var_clics        = tk.IntVar(value=4500)
+        self.roi_var_ctr          = tk.DoubleVar(value=3.0)
+        self.roi_var_duracion     = tk.IntVar(value=20)
+        self.roi_var_conversiones = tk.IntVar(value=120)
+
+        self._form_spinbox(fgrid, 0, 0, "Presupuesto (S/)", self.roi_var_presupuesto,  500,  15000, 50)
+        self._form_spinbox(fgrid, 0, 1, "Impresiones",      self.roi_var_impresiones,  1000, 500000, 1000)
+        self._form_spinbox(fgrid, 1, 0, "Clics",            self.roi_var_clics,        10,   20000, 10)
+        self._form_slider(fgrid, 1, 1, "CTR (%)",           self.roi_var_ctr,          0.5,  8.0, lambda v: f"{float(v):.1f}%")
+        self._form_slider(fgrid, 2, 0, "Duración (días)",   self.roi_var_duracion,     3,    60, lambda v: f"{int(float(v))} días")
+        self._form_spinbox(fgrid, 2, 1, "Conversiones",     self.roi_var_conversiones, 1,    500, 1)
+
+        btn_pred = tk.Label(form_card, text="🧮  Predecir ROI con Regresión Lineal",
+                            bg=Theme.ACCENT_BG, fg=Theme.ACCENT,
+                            font=(Theme.FONT_FAMILY, 10, "bold"), pady=9, cursor="hand2")
+        btn_pred.pack(fill="x", padx=14, pady=(10, 14))
+        btn_pred.bind("<Button-1>", lambda e: self._ejecutar_prediccion_roi())
+
+        self.roi_result_card  = make_card(scroll)
+        self.roi_result_inner = None
+
+        note = tk.Frame(scroll, bg=Theme.GOLD_BG, highlightbackground=Theme.GOLD, highlightthickness=1)
+        note.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Label(note, bg=Theme.GOLD_BG, fg=Theme.GOLD, justify="left", anchor="w",
+                 font=(Theme.FONT_FAMILY, 8),
+                 text="🎓  KPI del objetivo: ROI de campaña / Costo por Adquisición (CPA). Este "
+                      "modelo permite simular campañas antes de invertir el presupuesto real, "
+                      "priorizando aquellas con mayor retorno esperado.",
+                 wraplength=1100).pack(fill="x", padx=12, pady=10)
+        return view
     # ─────────────────────────────────────────────── TOPBAR ──────────────────
     def _build_topbar(self):
         bar = tk.Frame(self, bg=Theme.BG2, height=58)
@@ -545,6 +1697,15 @@ class SmartSegApp(tk.Tk):
             max_depth=self.var_max_depth.get(),
             features=self._selected_features(),
             test_size=self.var_test_size.get(),
+        )
+        self.roi_model.generar_dataset_simulado()
+        self.roi_model.entrenar(features=list(ROI_FEATURES), test_size=self.roi_var_test_size.get())
+        self.churn_model.generar_dataset_simulado()
+        self.churn_model.entrenar(
+            n_estimators=self.churn_var_n_estimators.get(),
+            max_depth=self.churn_var_max_depth.get(),
+            features=list(CHURN_FEATURES),
+            test_size=self.churn_var_test_size.get(),
         )
         self._actualizar_badge_modelo()
         self._actualizar_fuente_label()
@@ -669,6 +1830,8 @@ class SmartSegApp(tk.Tk):
         self.views["Predicción"]                = self._build_prediccion_view()
         self.views["Entrenamiento vs Prueba"]    = self._build_comparacion_view()
         self.views["Reglas del árbol"]           = self._build_reglas_view()
+        self.views["ROI Campañas"] = self._build_roi_view()
+        self.views["Riesgo de Abandono"] = self._build_churn_view()
 
     def _refresh_views(self):
         for tab in ("Panel", "Segmentos", "Entrenamiento vs Prueba", "Reglas del árbol"):
